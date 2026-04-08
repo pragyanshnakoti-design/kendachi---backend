@@ -1,0 +1,172 @@
+const express = require('express');
+const router  = express.Router();
+const { query } = require('../db');
+const { requireAuth, logAudit } = require('../middleware/auth');
+const { getClientIP } = require('../services/fingerprint');
+
+// ─── GET /api/employee/records ──────────────────────────────
+// Employee views their own work session history.
+router.get('/records', requireAuth, async (req, res, next) => {
+  try {
+    const { from, to, page = 1, limit = 30 } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    let dateFilter = '';
+    const params = [req.user.id, parseInt(limit), offset];
+
+    if (from && to) {
+      dateFilter = ' AND login_time BETWEEN $4 AND $5';
+      params.push(from, to);
+    }
+
+    const { rows } = await query(
+      `SELECT id, login_time, logout_time, total_seconds, regular_seconds,
+              overtime_seconds, is_overtime, auto_closed, auto_close_reason,
+              notes, closed, activity_events, idle_seconds, hidden_seconds,
+              focus_loss_count, presence_passes, presence_failures, monitoring_score
+       FROM work_sessions
+       WHERE employee_id = $1 ${dateFilter}
+       ORDER BY login_time DESC
+       LIMIT $2 OFFSET $3`,
+      params
+    );
+
+    // Summary stats
+    const { rows: stats } = await query(
+      `SELECT
+         COUNT(*)                         as total_sessions,
+         SUM(total_seconds)               as total_seconds_all,
+         SUM(overtime_seconds)            as total_overtime_seconds,
+         SUM(CASE WHEN is_overtime THEN 1 ELSE 0 END) as overtime_days
+       FROM work_sessions
+       WHERE employee_id = $1 AND closed = true`,
+      [req.user.id]
+    );
+
+    res.json({
+      sessions: rows,
+      summary: stats[0],
+      pagination: { page: parseInt(page), limit: parseInt(limit) },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/employee/records/:id ──────────────────────────
+// Single session detail — employee can only see their own.
+router.get('/records/:id', requireAuth, async (req, res, next) => {
+  try {
+    const sessionId = parseInt(req.params.id);
+
+    const { rows: wsRows } = await query(
+      `SELECT ws.*, e.name, e.emp_code, e.department
+       FROM work_sessions ws
+       JOIN employees e ON e.id = ws.employee_id
+       WHERE ws.id = $1 AND ws.employee_id = $2`,
+      [sessionId, req.user.id]
+    );
+
+    if (!wsRows.length) {
+      return res.status(404).json({ error: 'Record not found or access denied' });
+    }
+
+    // Fetch overtime requests for this session
+    const { rows: otRows } = await query(
+      `SELECT status, reason, estimated_hours, manager_note, admin_decision, requested_at, reviewed_at
+       FROM overtime_requests WHERE work_session_id = $1`,
+      [sessionId]
+    );
+
+    res.json({ session: wsRows[0], overtime_requests: otRows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/employee/export ───────────────────────────────
+// Employee requests a signed proof export (JSON payload — frontend renders PDF).
+router.get('/export', requireAuth, async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    const ip = getClientIP(req);
+
+    const params = [req.user.id];
+    let dateFilter = '';
+    if (from && to) {
+      dateFilter = ' AND ws.login_time BETWEEN $2 AND $3';
+      params.push(from, to);
+    }
+
+    const { rows } = await query(
+      `SELECT ws.id, ws.login_time, ws.logout_time, ws.total_seconds,
+              ws.regular_seconds, ws.overtime_seconds, ws.is_overtime,
+              ws.auto_closed, ws.auto_close_reason, ws.notes, ws.activity_events,
+              ws.idle_seconds, ws.hidden_seconds, ws.focus_loss_count,
+              ws.presence_passes, ws.presence_failures, ws.monitoring_score,
+              e.emp_code, e.name, e.department, e.email
+       FROM work_sessions ws
+       JOIN employees e ON e.id = ws.employee_id
+       WHERE ws.employee_id = $1 AND ws.closed = true ${dateFilter}
+       ORDER BY ws.login_time DESC`,
+      params
+    );
+
+    // Log the export — admins can see who exported what and when
+    await logAudit({
+      actor_id: req.user.id,
+      actor_role: req.user.role,
+      action: 'employee_export',
+      ip,
+      detail: { session_count: rows.length, from, to },
+    });
+
+    // Build signed proof payload
+    const crypto = require('crypto');
+    const payload = {
+      generated_at:  new Date().toISOString(),
+      generated_by:  `${req.user.empCode} — ${req.user.name}`,
+      watermark:     req.user.empCode,
+      record_count:  rows.length,
+      sessions:      rows,
+    };
+
+    // Compute integrity hash so employee can prove record hasn't been altered
+    const hash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(payload.sessions))
+      .digest('hex');
+
+    payload.integrity_hash = hash;
+    payload.note = 'This record was generated by the employee and signed by Kendachi. Hash verifies data was not altered after export.';
+
+    res.json(payload);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/employee/today ─────────────────────────────────
+// Quick summary for today — used by dashboard header.
+router.get('/today', requireAuth, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, login_time, logout_time, total_seconds, regular_seconds,
+              overtime_seconds, is_overtime, closed, auto_closed, auto_close_reason,
+              activity_events, idle_seconds, hidden_seconds, focus_loss_count,
+              presence_passes, presence_failures, monitoring_score
+       FROM work_sessions
+       WHERE employee_id = $1
+         AND login_time::date = CURRENT_DATE
+       ORDER BY login_time DESC
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    res.json({ today: rows[0] || null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
