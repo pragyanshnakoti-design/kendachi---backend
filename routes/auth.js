@@ -20,13 +20,18 @@ function positiveInt(value, fallback) {
 const OTP_EXPIRE_MIN = positiveInt(process.env.OTP_EXPIRES_MINUTES, 2);
 const OTP_VERIFY_ATTEMPTS = positiveInt(process.env.OTP_VERIFY_ATTEMPTS, 4);
 const MAX_ACTIVE_LOGIN_SESSIONS = positiveInt(process.env.MAX_ACTIVE_LOGIN_SESSIONS, 4);
+const hasRealResendConfig =
+  Boolean(process.env.RESEND_API_KEY) &&
+  !process.env.RESEND_API_KEY.includes('REPLACE_WITH') &&
+  Boolean(process.env.EMAIL_FROM) &&
+  !process.env.EMAIL_FROM.includes('yourdomain.com');
+const exposeDevOtpOverride = String(process.env.EXPOSE_DEV_OTP || '').toLowerCase();
 const shouldExposeDevOtp =
-  process.env.NODE_ENV !== 'production' &&
-  (
-    process.env.USE_IN_MEMORY_DB === 'true' ||
-    !process.env.RESEND_API_KEY ||
-    process.env.RESEND_API_KEY.includes('REPLACE_WITH')
-  );
+  exposeDevOtpOverride === 'true'
+    ? true
+    : exposeDevOtpOverride === 'false'
+    ? false
+    : process.env.NODE_ENV !== 'production' && !hasRealResendConfig;
 
 router.post('/request-otp', otpRequestLimiter, async (req, res, next) => {
   try {
