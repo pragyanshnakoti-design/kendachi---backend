@@ -74,6 +74,25 @@ async function verifyConnection() {
   }
 }
 
+async function ensureSeedAdmin() {
+  const seedAdminEmail = String(process.env.SEED_ADMIN_EMAIL || '').trim().toLowerCase();
+  if (!seedAdminEmail) return;
+
+  const seedAdminName = String(process.env.SEED_ADMIN_NAME || 'Demo Admin').trim() || 'Demo Admin';
+
+  await pool.query(
+    `INSERT INTO employees (emp_code, name, email, department, role)
+     VALUES ('ADMIN-ENV', $1, $2, 'IT', 'admin')
+     ON CONFLICT (email) DO UPDATE
+       SET name = EXCLUDED.name,
+           role = 'admin',
+           is_active = true`,
+    [seedAdminName, seedAdminEmail]
+  );
+
+  console.log(`[DB] Seed admin ready: ${seedAdminEmail}`);
+}
+
 async function ensureMonitoringSchema() {
   const statements = [
     "ALTER TABLE otp_codes ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
@@ -102,12 +121,14 @@ async function ensureMonitoringSchema() {
 async function initDB() {
   try {
     await ensureMonitoringSchema();
+    await ensureSeedAdmin();
     await verifyConnection();
   } catch (err) {
     if (!useInMemoryDb) {
       await switchToInMemoryDb(err);
       try {
         await ensureMonitoringSchema();
+        await ensureSeedAdmin();
         await verifyConnection();
         return;
       } catch (fallbackErr) {
