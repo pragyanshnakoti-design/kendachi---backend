@@ -3,6 +3,7 @@ const router  = express.Router();
 const { query } = require('../db');
 const { requireAuth, requireRole, logAudit } = require('../middleware/auth');
 const { getClientIP } = require('../services/fingerprint');
+const { REASON_CODES, proposeCorrection } = require('../services/governance');
 
 // All manager routes require manager OR admin role.
 router.use(requireAuth, requireRole('manager', 'admin'));
@@ -94,5 +95,45 @@ router.get('/overtime-queue', async (req, res, next) => {
 // ─── BLOCK: no edit routes exist for manager ─────────────────
 // Any attempt to POST/PATCH/DELETE work_sessions data returns 403.
 // This is enforced via missing routes + requireRole on admin routes.
+
+router.post('/corrections/propose', async (req, res, next) => {
+  try {
+    const { work_session_id, field_changed, new_value, reason_code, reason } = req.body;
+    const result = await proposeCorrection({
+      workSessionId: work_session_id,
+      fieldChanged: field_changed,
+      newValue: new_value,
+      reasonCode: reason_code,
+      reason,
+      proposer: req.user,
+    });
+
+    await logAudit({
+      actor_id: req.user.id,
+      actor_role: req.user.role,
+      action: 'manager_correction_proposed',
+      table: 'work_sessions',
+      target_id: work_session_id,
+      ip: getClientIP(req),
+      detail: {
+        correction_id: result.correction.id,
+        field_changed,
+        old_value: result.oldValue,
+        new_value,
+        reason_code: result.reasonCode,
+        governance: 'admin_review_required',
+      },
+    });
+
+    res.status(201).json({
+      correction: result.correction,
+      message: 'Correction proposed. Admin/HR approval is required before it is accepted.',
+      reason_codes: REASON_CODES,
+    });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
 
 module.exports = router;
