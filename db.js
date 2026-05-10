@@ -105,7 +105,56 @@ async function ensureMonitoringSchema() {
     "ALTER TABLE work_sessions ADD COLUMN presence_failures INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE work_sessions ADD COLUMN monitoring_score INTEGER NOT NULL DEFAULT 100",
     "ALTER TABLE work_sessions ADD COLUMN auto_close_reason TEXT",
+    "ALTER TABLE corrections ADD COLUMN reason_code VARCHAR(80) NOT NULL DEFAULT 'other'",
+    "ALTER TABLE corrections ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE corrections ADD COLUMN reviewed_at TIMESTAMPTZ",
   ];
+
+  if (!useInMemoryDb) {
+    statements.push(
+      `CREATE TABLE IF NOT EXISTS employee_notifications (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER,
+      type VARCHAR(60),
+      title VARCHAR(160),
+      message TEXT,
+      detail JSONB,
+      read BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
+      `CREATE TABLE IF NOT EXISTS proof_anchors (
+      id SERIAL PRIMARY KEY,
+      work_session_id INTEGER,
+      anchor_type VARCHAR(40) DEFAULT 'session_clockout',
+      record_hash VARCHAR(64),
+      merkle_root VARCHAR(64),
+      provider VARCHAR(80),
+      provider_ref TEXT,
+      status VARCHAR(30) DEFAULT 'pending_external_anchor',
+      requested_at TIMESTAMPTZ DEFAULT NOW(),
+      anchored_at TIMESTAMPTZ,
+      metadata JSONB
+    )`,
+      `CREATE TABLE IF NOT EXISTS dispute_tickets (
+      id SERIAL PRIMARY KEY,
+      work_session_id INTEGER,
+      employee_id INTEGER,
+      opened_by INTEGER,
+      dispute_type VARCHAR(80) DEFAULT 'hours_dispute',
+      status VARCHAR(20) DEFAULT 'open',
+      employee_statement TEXT,
+      manager_statement TEXT,
+      director_decision TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      decided_at TIMESTAMPTZ
+    )`,
+      "CREATE INDEX IF NOT EXISTS idx_corrections_session ON corrections(work_session_id)",
+      "CREATE INDEX IF NOT EXISTS idx_corrections_status ON corrections(status)",
+      "CREATE INDEX IF NOT EXISTS idx_notifications_employee ON employee_notifications(employee_id)",
+      "CREATE INDEX IF NOT EXISTS idx_proof_anchors_session ON proof_anchors(work_session_id)",
+      "CREATE INDEX IF NOT EXISTS idx_dispute_employee ON dispute_tickets(employee_id)",
+    );
+  }
 
   for (const statement of statements) {
     try {
