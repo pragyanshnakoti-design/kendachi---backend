@@ -1,7 +1,7 @@
 -- ═══════════════════════════════════════════════════════════
--- KENDACHI — Database Schema
--- Immutable audit design: records are NEVER deleted or overwritten.
--- Corrections are added as new rows with reference to original.
+-- KENDACHI - Database Schema
+-- Correction governance design: every hour is accounted for, and every
+-- correction leaves a permanent trail beside the original record.
 -- ═══════════════════════════════════════════════════════════
 
 -- ─── Employees ─────────────────────────────────────────────
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS active_sessions (
 );
 
 -- ─── Work Sessions ─────────────────────────────────────────
--- Core table. IMMUTABLE after logout — no UPDATE on closed rows.
+-- Core table. Closed rows preserve the original session facts.
 CREATE TABLE IF NOT EXISTS work_sessions (
   id               SERIAL PRIMARY KEY,
   employee_id      INTEGER     NOT NULL REFERENCES employees(id),
@@ -104,20 +104,68 @@ CREATE TABLE IF NOT EXISTS overtime_requests (
 );
 
 -- ─── Corrections ───────────────────────────────────────────
--- Admin cannot delete/edit work_sessions. Corrections are appended here.
--- Original row always stays. This is the "justice" layer.
+-- Corrections are governed proposals. Original row always stays.
+-- A second person must approve before a correction becomes accepted.
 CREATE TABLE IF NOT EXISTS corrections (
   id               SERIAL PRIMARY KEY,
   work_session_id  INTEGER     NOT NULL REFERENCES work_sessions(id),
-  corrected_by     INTEGER     NOT NULL REFERENCES employees(id),  -- must be admin
+  corrected_by     INTEGER     NOT NULL REFERENCES employees(id),  -- proposer
   field_changed    VARCHAR(50) NOT NULL,        -- e.g. 'logout_time'
   old_value        TEXT        NOT NULL,
   new_value        TEXT        NOT NULL,
+  reason_code      VARCHAR(80) NOT NULL DEFAULT 'other',
   reason           TEXT        NOT NULL,
-  requires_second_admin BOOLEAN NOT NULL DEFAULT false,
+  requires_second_admin BOOLEAN NOT NULL DEFAULT true,
   second_admin_id  INTEGER     REFERENCES employees(id),
+  status           VARCHAR(20) NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending','approved','rejected')),
   applied          BOOLEAN     NOT NULL DEFAULT false,
+  reviewed_at      TIMESTAMPTZ,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Employee notifications for governed corrections and disputes.
+CREATE TABLE IF NOT EXISTS employee_notifications (
+  id               SERIAL PRIMARY KEY,
+  employee_id      INTEGER     NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  type             VARCHAR(60) NOT NULL,
+  title            VARCHAR(160) NOT NULL,
+  message          TEXT        NOT NULL,
+  detail           JSONB,
+  read             BOOLEAN     NOT NULL DEFAULT false,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- External proof anchor records. In production, record_hash can be sent to
+-- RFC 3161 TSA or included in a daily public ledger anchor.
+CREATE TABLE IF NOT EXISTS proof_anchors (
+  id               SERIAL PRIMARY KEY,
+  work_session_id  INTEGER     NOT NULL REFERENCES work_sessions(id),
+  anchor_type      VARCHAR(40) NOT NULL DEFAULT 'session_clockout',
+  record_hash      VARCHAR(64) NOT NULL,
+  merkle_root      VARCHAR(64),
+  provider         VARCHAR(80) NOT NULL,
+  provider_ref     TEXT,
+  status           VARCHAR(30) NOT NULL DEFAULT 'pending_external_anchor',
+  requested_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  anchored_at      TIMESTAMPTZ,
+  metadata         JSONB
+);
+
+-- Dispute tickets preserve both sides' evidence before final mediation.
+CREATE TABLE IF NOT EXISTS dispute_tickets (
+  id               SERIAL PRIMARY KEY,
+  work_session_id  INTEGER     NOT NULL REFERENCES work_sessions(id),
+  employee_id      INTEGER     NOT NULL REFERENCES employees(id),
+  opened_by        INTEGER     REFERENCES employees(id),
+  dispute_type     VARCHAR(80) NOT NULL DEFAULT 'hours_dispute',
+  status           VARCHAR(20) NOT NULL DEFAULT 'open'
+                             CHECK (status IN ('open','under_review','resolved','rejected')),
+  employee_statement TEXT,
+  manager_statement  TEXT,
+  director_decision  TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  decided_at       TIMESTAMPTZ
 );
 
 -- ─── Audit Log ─────────────────────────────────────────────
@@ -163,6 +211,11 @@ CREATE INDEX IF NOT EXISTS idx_audit_recorded ON audit_log(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_otp_employee ON otp_codes(employee_id);
 CREATE INDEX IF NOT EXISTS idx_active_sessions_token ON active_sessions(session_token);
 CREATE INDEX IF NOT EXISTS idx_anomaly_employee ON anomaly_flags(employee_id);
+CREATE INDEX IF NOT EXISTS idx_corrections_session ON corrections(work_session_id);
+CREATE INDEX IF NOT EXISTS idx_corrections_status ON corrections(status);
+CREATE INDEX IF NOT EXISTS idx_notifications_employee ON employee_notifications(employee_id);
+CREATE INDEX IF NOT EXISTS idx_proof_anchors_session ON proof_anchors(work_session_id);
+CREATE INDEX IF NOT EXISTS idx_dispute_employee ON dispute_tickets(employee_id);
 
 -- ─── Seed: First Admin ─────────────────────────────────────
 -- Replace email with real admin email before running.
