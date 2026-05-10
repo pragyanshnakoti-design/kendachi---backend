@@ -1,24 +1,29 @@
 const express = require('express');
-const router  = express.Router();
-const { query, transaction } = require('../db');
+
+const router = express.Router();
+const { query } = require('../db');
 const { requireAuth, requireRole, logAudit } = require('../middleware/auth');
 const { getClientIP } = require('../services/fingerprint');
+const {
+  REASON_CODES,
+  getPatternAlerts,
+  proposeCorrection,
+  reviewCorrection,
+} = require('../services/governance');
 
-// All admin routes require admin role — no exceptions.
 router.use(requireAuth, requireRole('admin'));
 
-// ─── GET /api/admin/dashboard ───────────────────────────────
-// High-level stats for today.
 router.get('/dashboard', async (req, res, next) => {
   try {
     const { rows: stats } = await query(`
       SELECT
-        (SELECT COUNT(*) FROM employees WHERE is_active = true)              AS total_employees,
+        (SELECT COUNT(*) FROM employees WHERE is_active = true) AS total_employees,
         (SELECT COUNT(*) FROM work_sessions WHERE login_time::date = CURRENT_DATE) AS sessions_today,
-        (SELECT COUNT(*) FROM work_sessions WHERE closed = false)            AS currently_active,
-        (SELECT COUNT(*) FROM overtime_requests WHERE status = 'pending')   AS pending_ot,
-        (SELECT COUNT(*) FROM anomaly_flags WHERE resolved = false)         AS unresolved_flags,
-        (SELECT COUNT(*) FROM work_sessions WHERE monitoring_score < 70 AND login_time::date = CURRENT_DATE) AS monitoring_alerts
+        (SELECT COUNT(*) FROM work_sessions WHERE closed = false) AS currently_active,
+        (SELECT COUNT(*) FROM overtime_requests WHERE status = 'pending') AS pending_ot,
+        (SELECT COUNT(*) FROM anomaly_flags WHERE resolved = false) AS unresolved_flags,
+        (SELECT COUNT(*) FROM work_sessions WHERE monitoring_score < 70 AND login_time::date = CURRENT_DATE) AS monitoring_alerts,
+        (SELECT COUNT(*) FROM corrections WHERE status = 'pending') AS pending_corrections
     `);
 
     res.json({ stats: stats[0] });
@@ -27,13 +32,11 @@ router.get('/dashboard', async (req, res, next) => {
   }
 });
 
-// ─── GET /api/admin/records ─────────────────────────────────
-// All work sessions — full access.
 router.get('/records', async (req, res, next) => {
   try {
     const { from, to, employee_id, page = 1, limit = 50 } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    const params = [parseInt(limit), offset];
+    const offset = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+    const params = [parseInt(limit, 10), offset];
 
     let filter = '';
     if (from && to) {
@@ -69,74 +72,116 @@ router.get('/records', async (req, res, next) => {
   }
 });
 
-// ─── POST /api/admin/correct ────────────────────────────────
-// Admin submits a correction. Original row NEVER changes.
-// Correction is appended as a new row with reason + before/after values.
 router.post('/correct', async (req, res, next) => {
   try {
-    const { work_session_id, field_changed, new_value, reason } = req.body;
-
-    if (!work_session_id || !field_changed || !new_value || !reason) {
-      return res.status(400).json({ error: 'work_session_id, field_changed, new_value, reason all required' });
-    }
-
-    // Only these fields are correctable — prevents abuse
-    const CORRECTABLE = ['logout_time', 'login_time', 'notes'];
-    if (!CORRECTABLE.includes(field_changed)) {
-      return res.status(400).json({
-        error: `Field '${field_changed}' cannot be corrected. Allowed: ${CORRECTABLE.join(', ')}`,
-      });
-    }
-
-    // Get current value before correction
-    const { rows: wsRows } = await query(
-      `SELECT * FROM work_sessions WHERE id = $1`,
-      [work_session_id]
-    );
-    if (!wsRows.length) return res.status(404).json({ error: 'Work session not found' });
-
-    const oldValue = String(wsRows[0][field_changed] ?? '');
-
-    // Log correction (immutable — never update work_sessions rows for time fields)
-    const { rows: corrRows } = await query(
-      `INSERT INTO corrections
-         (work_session_id, corrected_by, field_changed, old_value, new_value, reason, applied)
-       VALUES ($1, $2, $3, $4, $5, $6, true)
-       RETURNING *`,
-      [work_session_id, req.user.id, field_changed, oldValue, new_value, reason]
-    );
-
-    // Only 'notes' is directly updated on the row — time fields are kept as correction records
-    if (field_changed === 'notes') {
-      await query(
-        'UPDATE work_sessions SET notes = $1 WHERE id = $2',
-        [new_value, work_session_id]
-      );
-    }
+    const { work_session_id, field_changed, new_value, reason_code, reason } = req.body;
+    const result = await proposeCorrection({
+      workSessionId: work_session_id,
+      fieldChanged: field_changed,
+      newValue: new_value,
+      reasonCode: reason_code,
+      reason,
+      proposer: req.user,
+    });
 
     await logAudit({
       actor_id: req.user.id,
       actor_role: req.user.role,
-      action: 'admin_correction',
+      action: 'correction_proposed',
       table: 'work_sessions',
       target_id: work_session_id,
       ip: getClientIP(req),
-      detail: { field_changed, old_value: oldValue, new_value, reason },
+      detail: {
+        correction_id: result.correction.id,
+        field_changed,
+        old_value: result.oldValue,
+        new_value,
+        reason_code: result.reasonCode,
+        reason,
+        governance: 'second_approval_required',
+      },
     });
 
-    res.status(201).json({ correction: corrRows[0] });
+    res.status(201).json({
+      correction: result.correction,
+      message: 'Correction proposed. A different approver must review it before it is applied.',
+      reason_codes: REASON_CODES,
+    });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.get('/corrections', async (req, res, next) => {
+  try {
+    const { status = 'pending' } = req.query;
+    const params = [];
+    let filter = '';
+    if (status !== 'all') {
+      params.push(status);
+      filter = 'WHERE c.status = $1';
+    }
+
+    const { rows } = await query(
+      `SELECT c.*, ws.employee_id, e.name AS employee_name, e.emp_code,
+              proposer.name AS proposer_name, reviewer.name AS reviewer_name
+       FROM corrections c
+       JOIN work_sessions ws ON ws.id = c.work_session_id
+       JOIN employees e ON e.id = ws.employee_id
+       JOIN employees proposer ON proposer.id = c.corrected_by
+       LEFT JOIN employees reviewer ON reviewer.id = c.second_admin_id
+       ${filter}
+       ORDER BY c.created_at DESC
+       LIMIT 100`,
+      params
+    );
+
+    res.json({ corrections: rows, reason_codes: REASON_CODES });
   } catch (err) {
     next(err);
   }
 });
 
-// ─── GET /api/admin/audit-log ───────────────────────────────
-// Full audit trail — every action ever taken in the system.
+router.post('/corrections/:id/review', async (req, res, next) => {
+  try {
+    const correction = await reviewCorrection({
+      correctionId: parseInt(req.params.id, 10),
+      reviewer: req.user,
+      decision: req.body.decision,
+      comment: req.body.comment,
+    });
+
+    await logAudit({
+      actor_id: req.user.id,
+      actor_role: req.user.role,
+      action: `correction_${req.body.decision}`,
+      table: 'corrections',
+      target_id: correction.id,
+      ip: getClientIP(req),
+      detail: { correction_id: correction.id, comment: req.body.comment || null },
+    });
+
+    res.json({ correction });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.get('/patterns', async (req, res, next) => {
+  try {
+    res.json(await getPatternAlerts());
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/audit-log', async (req, res, next) => {
   try {
     const { from, to, actor_id, action, page = 1 } = req.query;
-    const limit  = 100;
-    const offset = (parseInt(page) - 1) * limit;
+    const limit = 100;
+    const offset = (parseInt(page, 10) - 1) * limit;
     const params = [limit, offset];
     let filter = '';
 
@@ -169,7 +214,6 @@ router.get('/audit-log', async (req, res, next) => {
   }
 });
 
-// ─── GET /api/admin/anomalies ───────────────────────────────
 router.get('/anomalies', async (req, res, next) => {
   try {
     const { rows } = await query(
@@ -185,14 +229,13 @@ router.get('/anomalies', async (req, res, next) => {
   }
 });
 
-// ─── POST /api/admin/anomalies/:id/resolve ──────────────────
 router.post('/anomalies/:id/resolve', async (req, res, next) => {
   try {
     const { rows } = await query(
       `UPDATE anomaly_flags
        SET resolved = true, resolved_by = $1, resolved_at = NOW()
        WHERE id = $2 RETURNING *`,
-      [req.user.id, parseInt(req.params.id)]
+      [req.user.id, parseInt(req.params.id, 10)]
     );
 
     if (!rows.length) return res.status(404).json({ error: 'Flag not found' });
@@ -202,7 +245,7 @@ router.post('/anomalies/:id/resolve', async (req, res, next) => {
       actor_role: req.user.role,
       action: 'anomaly_resolved',
       table: 'anomaly_flags',
-      target_id: parseInt(req.params.id),
+      target_id: parseInt(req.params.id, 10),
       ip: getClientIP(req),
     });
 
@@ -212,12 +255,10 @@ router.post('/anomalies/:id/resolve', async (req, res, next) => {
   }
 });
 
-// ─── GET /api/admin/export-full ─────────────────────────────
-// Full org export — admin only, every action logged with admin watermark.
 router.get('/export-full', async (req, res, next) => {
   try {
-    const { from, to } = req.query;
     const crypto = require('crypto');
+    const { from, to } = req.query;
     const params = [];
     let filter = '';
     if (from && to) {
@@ -235,11 +276,12 @@ router.get('/export-full', async (req, res, next) => {
     );
 
     const payload = {
-      generated_at:  new Date().toISOString(),
-      generated_by:  `${req.user.empCode} — ${req.user.name} [ADMIN]`,
-      watermark:     `ADMIN:${req.user.empCode}`,
-      record_count:  rows.length,
-      sessions:      rows,
+      generated_at: new Date().toISOString(),
+      generated_by: `${req.user.empCode} - ${req.user.name} [ADMIN]`,
+      watermark: `ADMIN:${req.user.empCode}`,
+      promise: 'Every hour is accounted for, and every correction leaves a permanent trail.',
+      record_count: rows.length,
+      sessions: rows,
       integrity_hash: crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
     };
 
@@ -257,21 +299,14 @@ router.get('/export-full', async (req, res, next) => {
   }
 });
 
-// ─── DELETE /api/admin/employees/:id/deactivate ─────────────
-// Soft delete — never hard-delete, records must stay.
 router.post('/employees/:id/deactivate', async (req, res, next) => {
   try {
-    const empId = parseInt(req.params.id);
+    const empId = parseInt(req.params.id, 10);
     if (empId === req.user.id) {
       return res.status(400).json({ error: 'Cannot deactivate yourself' });
     }
 
-    await query(
-      'UPDATE employees SET is_active = false WHERE id = $1',
-      [empId]
-    );
-
-    // Kill active sessions
+    await query('UPDATE employees SET is_active = false WHERE id = $1', [empId]);
     await query('DELETE FROM active_sessions WHERE employee_id = $1', [empId]);
 
     await logAudit({
