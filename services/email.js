@@ -36,7 +36,7 @@ async function sendOTP(toEmail, employeeName, code, expiresMinutes) {
       <p style="color:#475569;font-size:12px;margin:0 0 4px">This code expires in <strong style="color:#0f172a">${expiresMinutes} minute(s)</strong>.</p>
       <p style="color:#475569;font-size:12px;margin:0 0 24px">If you did not request this, contact your IT administrator immediately.</p>
       <div style="border-top:1px solid #dbe2ea;padding-top:16px;font-size:11px;color:#64748b">
-        Kendachi - Employee Justice & Audit Platform<br>
+        Kendachi - Accountable Work & Correction Governance<br>
         This is an automated message. Do not reply.
       </div>
     </div>
