@@ -4,6 +4,7 @@ const { query } = require('../db');
 const { requireAuth, logAudit } = require('../middleware/auth');
 const { getClientIP, buildFingerprint } = require('../services/fingerprint');
 const { checkSessionAnomaly } = require('../services/anomaly');
+const { createSessionAnchor } = require('../services/proof');
 
 const router = express.Router();
 
@@ -170,6 +171,11 @@ async function autoCloseSession(workSessionId, user, totalSeconds, metrics, reas
     threat: metrics.presence_failures > 0 ? 'high' : 'medium',
   });
 
+  const proofAnchor = await createSessionAnchor(workSessionId, 'session_auto_close').catch((err) => {
+    console.error('[PROOF] Anchor creation failed:', err.message);
+    return null;
+  });
+
   return {
     work_session_id: workSessionId,
     logout_time: logoutTime,
@@ -179,6 +185,7 @@ async function autoCloseSession(workSessionId, user, totalSeconds, metrics, reas
     is_overtime: overtimeSeconds > 0,
     monitoring_score: monitoringScore,
     auto_close_reason: reason,
+    proof_anchor: proofAnchor,
   };
 }
 
@@ -462,6 +469,10 @@ router.post('/stop', requireAuth, async (req, res, next) => {
     );
 
     checkSessionAnomaly(req.user, work_session_id, totalSeconds).catch(console.error);
+    const proofAnchor = await createSessionAnchor(work_session_id, 'session_clockout').catch((err) => {
+      console.error('[PROOF] Anchor creation failed:', err.message);
+      return null;
+    });
 
     await logAudit({
       actor_id: req.user.id,
@@ -475,6 +486,7 @@ router.post('/stop', requireAuth, async (req, res, next) => {
         overtime: overtimeSeconds > 0,
         monitoring_score: monitoringScore,
         presence_failures: metrics.presence_failures,
+        proof_anchor_status: proofAnchor?.status || 'not_created',
       },
     });
 
@@ -495,6 +507,7 @@ router.post('/stop', requireAuth, async (req, res, next) => {
         focus_loss_count: metrics.focus_loss_count,
         presence_passes: metrics.presence_passes,
         presence_failures: metrics.presence_failures,
+        proof_anchor: proofAnchor,
       },
     });
   } catch (err) {
