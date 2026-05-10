@@ -1,6 +1,29 @@
 const jwt = require('jsonwebtoken');
 const { query } = require('../db');
 const { verifyFingerprint, verifyIP, getClientIP } = require('../services/fingerprint');
+const { sendAnomalyAlert } = require('../services/email');
+
+async function raiseSessionSecurityIncident(session, type, description, ip, detail = {}) {
+  await query('DELETE FROM active_sessions WHERE session_token = $1', [session.session_token]);
+
+  await query(
+    `INSERT INTO anomaly_flags (employee_id, flag_type, description, severity, metadata)
+     VALUES ($1, $2, $3, 'critical', $4)`,
+    [session.emp_id, type, description, JSON.stringify({ ...detail, ip })]
+  );
+
+  const { rows: admins } = await query(
+    `SELECT email FROM employees WHERE role = 'admin' AND is_active = true`
+  );
+
+  for (const admin of admins) {
+    try {
+      await sendAnomalyAlert(admin.email, session.name, type, description);
+    } catch (err) {
+      console.error('[SECURITY] Admin alert failed:', err.message);
+    }
+  }
+}
 
 // ─── Verify JWT and bind to session ────────────────────────
 async function requireAuth(req, res, next) {
@@ -41,6 +64,13 @@ async function requireAuth(req, res, next) {
     // ── Session binding checks ──────────────────────────────
     const currentIP = getClientIP(req);
     if (!verifyIP(req, session.ip_address)) {
+      await raiseSessionSecurityIncident(
+        session,
+        'session_ip_mismatch_revoked',
+        `Session revoked because IP changed from ${session.ip_address} to ${currentIP}.`,
+        currentIP,
+        { stored: session.ip_address, current: currentIP }
+      );
       await logAudit({
         actor_id: session.emp_id,
         action: 'session_ip_mismatch',
@@ -56,6 +86,13 @@ async function requireAuth(req, res, next) {
     }
 
     if (!verifyFingerprint(req, session.device_fingerprint)) {
+      await raiseSessionSecurityIncident(
+        session,
+        'session_device_mismatch_revoked',
+        'Session revoked because the device fingerprint changed.',
+        currentIP,
+        { sessionId: session.id }
+      );
       await logAudit({
         actor_id: session.emp_id,
         action: 'session_fingerprint_mismatch',
